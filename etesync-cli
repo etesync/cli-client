@@ -1,0 +1,217 @@
+#!/usr/bin/env python
+
+import argparse
+import getpass
+import os
+import base64
+import json
+import vobject
+
+import etesync as api
+
+from cryptography.fernet import InvalidToken
+
+remoteUrl = api.API_URL
+
+USERS_FILE = os.path.join(os.path.expanduser('~'), '.etesync-cli', 'users_cache')
+
+directory = os.path.dirname(USERS_FILE)
+if directory != '' and not os.path.exists(directory):
+    os.makedirs(directory)
+
+
+def printJournal(entry):
+    journal = entry.info
+    print('\t{} ({})'.format(journal['displayName'], entry.uid))
+    if journal.get('readOnly', False):
+        print('\t\tRead only')
+
+
+def printEntry(journal, entry):
+    content = json.loads(entry.content)
+    vobj = vobject.readOne(content['content'])
+
+    print('{} {}'.format(content['action'],
+                         journal.collection.get_content_class().get_uid(content['content'])))
+    vobj.prettyPrint()
+
+    print()
+
+
+class EncryptedCache:
+    def __init__(self, filename):
+
+        self.filename = filename
+        self.load()
+
+    def init_encryption(self, username, password):
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+        salt = username.encode()
+        kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=100000,
+                backend=default_backend()
+                )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        self.f = Fernet(key)
+
+    def encrypt(self, data):
+        return self.f.encrypt(data.encode())
+
+    def decrypt(self, data):
+        return self.f.decrypt(data)
+
+    def load(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, "r") as f:
+                data = f.read()
+                if not data:
+                    self.content = {'users': {}}
+                else:
+                    self.content = json.loads(data)
+        else:
+            self.content = {'users': {}}
+
+    def save(self):
+        with open(self.filename, "w") as f:
+            f.write(json.dumps(self.content))
+
+    def list(self):
+        users = self.content['users']
+        return users.keys()
+
+    def get(self, username):
+        users = self.content['users']
+        user = users.get(username)
+        if user is None:
+            return user
+        user = json.loads(self.decrypt(user.encode()))
+        return user['authToken'], base64.b64decode(user['cipherKey'])
+
+    def set(self, username, auth_token, cipher_key):
+        users = self.content['users']
+        user = self.encrypt(json.dumps({
+                'authToken': auth_token,
+                'cipherKey': base64.b64encode(cipher_key).decode(),
+            })).decode()
+        users[username] = user
+
+    def delete(self, username):
+        users = self.content['users']
+        users.pop(username, None)
+
+
+parser = argparse.ArgumentParser(description="""A command line tool to access the change journal and contents of your EteSync account.
+
+You will be prompted for passwords as needed, or alternatively, you can set your password in the environment variable
+"ETESYNC_ENC_PASS".""")
+subparsers = parser.add_subparsers(help='available commands use "command -h" for help', dest='command')
+parser_sync = subparsers.add_parser('sync', help='Sync the local cache with the remote server')
+parser_sync.add_argument("username", help="The username used with EteSync")
+
+parser_list = subparsers.add_parser('list', help='List collections (e.g. Calendars)')
+parser_list.add_argument("username", help="The username used with EteSync")
+parser_list.add_argument("journal", nargs='?', help="The UID of the journal (or any prefix of it)")
+
+parser_journal = subparsers.add_parser('journal', help='View the change journal')
+parser_journal.add_argument("username", help="The username used with EteSync")
+parser_journal.add_argument("journal", help="The UID of the journal (or any prefix of it)")
+
+parser_user = subparsers.add_parser('user', help='Add, list and remove users from the client')
+user_subparsers = parser_user.add_subparsers(help='sub-command -h for help', dest='sub_command')
+parser_user_list = user_subparsers.add_parser('list', help='List all users')
+parser_user_add = user_subparsers.add_parser('add', help='Add a user')
+parser_user_add.add_argument("username", help="The username used with EteSync")
+parser_user_del = user_subparsers.add_parser('del', help='Delete a user')
+parser_user_del.add_argument("username", help="The username used with EteSync")
+
+args = parser.parse_args()
+
+try:
+    creds = EncryptedCache(USERS_FILE)
+except InvalidToken:
+    raise RuntimeError("Wrong encryption password or corrupt database.")
+
+if args.command == 'user':
+    if args.sub_command == 'add':
+        servicePassword = getpass.getpass(prompt="Please enter the EteSync login password: ")
+        encryptionPassword = getpass.getpass(prompt="Please enter your encryption password: ")
+
+        creds.init_encryption(args.username, encryptionPassword)
+        exists = creds.get(args.username)
+        if exists:
+            raise RuntimeError("User already exists. Delete first if you'd like to override settings.")
+
+        authToken = api.Authenticator(remoteUrl).get_auth_token(args.username, servicePassword)
+
+        etesync = api.EteSync(args.username, authToken, remote=remoteUrl)
+
+        etesync.derive_key(encryptionPassword)
+        creds.set(args.username, etesync.auth_token, etesync.cipher_key)
+        creds.save()
+
+    elif args.sub_command == 'del':
+        creds.delete(args.username)
+        creds.save()
+
+    elif args.sub_command == 'list':
+        for user in creds.list():
+            print(user)
+else:
+    encryptionPassword = (os.environ.get('ETESYNC_ENC_PASS') or
+                          getpass.getpass(prompt="Please enter your encryption password: "))
+
+    creds.init_encryption(args.username, encryptionPassword)
+
+    if creds.get(args.username) is None:
+        raise RuntimeError("User doesn't exist, please add it first.")
+
+    authToken, cipherKey = creds.get(args.username)
+    etesync = api.EteSync(args.username, authToken, cipher_key=cipherKey, remote=remoteUrl)
+
+    if getattr(args, 'journal', None) is not None:
+        journal = None
+        for item in etesync.list():
+            if item.uid.startswith(args.journal):
+                journal = item
+
+    if args.command == 'sync':
+        etesync.sync()
+
+    elif args.command == 'list':
+        if args.journal:
+
+            if journal is None:
+                raise RuntimeError("No journal matching '{}' found!".format(args.journal))
+
+            # Or interact with the collection
+            print("Journal items: {}".format(len(list(journal.list()))))
+            print("Collection items: {}".format(len(list(journal.collection.list()))))
+
+            print('\n# Items')
+            for item in journal.collection.list():
+                vobj = vobject.readOne(item.content)
+                vobj.prettyPrint()
+        else:
+            print('# Address Books')
+            for contact in filter(lambda x: x.info.get('type') == api.AddressBook.TYPE, etesync.list()):
+                printJournal(contact)
+
+            print()
+            print('# Calendars')
+            for calendar in filter(lambda x: x.info.get('type') == api.Calendar.TYPE, etesync.list()):
+                printJournal(calendar)
+
+    elif args.command == 'journal':
+            print("Journal items: {}".format(len(list(journal.list()))))
+            print("Collection items: {}".format(len(list(journal.collection.list()))))
+
+            print('\n# Items')
+            for item in reversed(list(journal.list())):
+                printEntry(journal, item)
