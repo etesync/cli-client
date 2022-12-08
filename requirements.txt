@@ -19,5 +19,5 @@ pyscrypt==1.6.2
 python-dateutil==2.6.1
 requests==2.20.0
 six==1.11.0
-urllib3==1.24.2
+urllib3==1.26.5
 vobject==0.9.5
